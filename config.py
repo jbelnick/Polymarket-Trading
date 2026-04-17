@@ -7,6 +7,13 @@ All tunable parameters in one place. Override via environment variables.
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env from the repo root before any os.getenv() calls below.
+# Without this, ANTHROPIC_API_KEY / POLYMARKET_* / tuning overrides
+# never reach the process environment.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
