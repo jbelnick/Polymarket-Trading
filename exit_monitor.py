@@ -22,6 +22,7 @@ from pathlib import Path
 
 from config import (
     DATA_DIR,
+    DRY_RUN,
     EXIT_CHECK_INTERVAL_SEC,
     STALE_PRICE_THRESHOLD,
     STALE_THESIS_HOURS,
@@ -142,33 +143,114 @@ def evaluate_exit(position: Position, current_price: float) -> ExitReason | None
 
 async def close_position(position: Position, reason: ExitReason, exit_price: float) -> bool:
     """
-    Close an open position.
+    Close an open position by submitting the opposite-side FAK order
+    at the inside of the book, then record the resulting PnL on the
+    Position object.
 
-    Stub — in production, submit a sell/buy order via polymarket-cli or
-    the py-clob-client SDK.
+    The `exit_price` passed in is the midpoint used for PnL bookkeeping;
+    the actual submitted limit is read from the order book at send time.
     """
-    position.exit_price = exit_price
+    # Import lazily to avoid a circular import (exit_monitor ↔ executor).
+    from executor import (
+        CLOB_BUY,
+        CLOB_SELL,
+        _inside_spread_price,
+        get_clob_client,
+        save_positions,
+    )
+    from py_clob_client.clob_types import OrderArgs, OrderType
+
+    # Closing a long = sell; closing a short = buy.
+    closing_side = Side.SELL if position.side == Side.BUY else Side.BUY
+    shares = round(position.size / position.entry_price, 2) if position.entry_price > 0 else 0
+
+    if shares < 5:
+        logger.warning(
+            "EXIT skipped — position %s too small to close (shares=%.2f)",
+            position.token_id[:12],
+            shares,
+        )
+        return False
+
+    fill_price = exit_price  # default if we can't read the book or DRY_RUN
+
+    if DRY_RUN:
+        logger.info(
+            "DRY_RUN EXIT %s: %s %.2f shares @ %.4f — %s",
+            reason.value,
+            closing_side.value,
+            shares,
+            fill_price,
+            position.question[:50],
+        )
+    else:
+        limit_price = _inside_spread_price(position.token_id, closing_side)
+        if limit_price is None or limit_price <= 0 or limit_price >= 1:
+            logger.warning(
+                "EXIT skipped — no inside price for %s",
+                position.token_id[:12],
+            )
+            return False
+
+        side_constant = CLOB_BUY if closing_side == Side.BUY else CLOB_SELL
+
+        try:
+            client = get_clob_client()
+            signed = client.create_order(
+                OrderArgs(
+                    token_id=position.token_id,
+                    price=limit_price,
+                    size=shares,
+                    side=side_constant,
+                )
+            )
+            resp = client.post_order(signed, OrderType.FAK)
+        except Exception:
+            logger.exception("Exit order failed for %s", position.token_id[:12])
+            return False
+
+        if not resp or not resp.get("success"):
+            logger.error("EXIT rejected: %s — resp=%s", position.question[:50], resp)
+            return False
+
+        filled_shares = float(resp.get("takingAmount") or 0)
+        if filled_shares <= 0:
+            logger.warning(
+                "EXIT zero-fill (FAK): %s — book too thin at %.4f",
+                position.question[:50],
+                limit_price,
+            )
+            return False
+
+        fill_price = limit_price
+
+    # Record the exit
+    position.exit_price = fill_price
     position.exit_time = time.time()
     position.exit_reason = reason
 
-    # Calculate PnL
     if position.side == Side.BUY:
-        position.pnl = round((exit_price - position.entry_price) * position.size, 2)
+        position.pnl = round((fill_price - position.entry_price) * shares, 2)
     else:
-        position.pnl = round((position.entry_price - exit_price) * position.size, 2)
+        position.pnl = round((position.entry_price - fill_price) * shares, 2)
 
     logger.info(
         "EXIT %s: %s — entry=%.4f exit=%.4f pnl=$%.2f held=%.1fh — %s",
         reason.value,
         position.question[:50],
         position.entry_price,
-        exit_price,
+        fill_price,
         position.pnl,
         position.hours_held,
         position.token_id[:12],
     )
 
-    # TODO: Submit actual sell order to CLOB
+    # Persist updated state (the list lives in executor._open_positions).
+    try:
+        save_positions()
+    except Exception:
+        logger.exception("Failed to persist positions after exit")
+
     return True
 
 

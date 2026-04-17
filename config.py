@@ -21,6 +21,7 @@ QUEUE_FILE = DATA_DIR / "queue.json"
 TARGETS_FILE = DATA_DIR / "targets.json"
 THESIS_FILE = DATA_DIR / "thesis.json"
 TRADES_LOG = DATA_DIR / "trades.json"
+POSITIONS_FILE = DATA_DIR / "positions.json"
 LOG_FILE = BASE_DIR / "log.txt"
 
 # ── Polymarket CLI ─────────────────────────────────────────────────────────────
@@ -57,6 +58,10 @@ MIN_KELLY_FRACTION = float(os.getenv("MIN_KELLY", "0.02"))      # floor — skip
 CONSENSUS_FULL = 2          # agents agreeing → full position
 CONSENSUS_HALF = 1          # single agent    → half position
 WHALE_COPY_DELAY_SEC = 60   # seconds to wait before mirroring whale trade
+
+# DRY_RUN defaults TRUE — the bot logs orders but never submits them.
+# Set DRY_RUN=false in .env to actually put money on the line.
+DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in ("false", "0", "no")
 
 # ── Exit triggers ──────────────────────────────────────────────────────────────
 TARGET_PROFIT_FRACTION = float(os.getenv("TARGET_PROFIT_FRAC", "0.85"))  # 85% of gap
