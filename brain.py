@@ -247,6 +247,9 @@ async def brain_loop() -> None:
     # take 20+ min and the next scan would land before the first thesis.json
     # ever got written.
     max_per_cycle = int(os.getenv("BRAIN_MAX_PER_CYCLE", "30"))
+    # Skip SELL theses on markets priced below this — the 1000× liability-to-
+    # premium ratio on tail shorts is a poor match for bankroll-preservation.
+    min_sell_price = float(os.getenv("MIN_SELL_PRICE", "0.05"))
 
     while True:
         try:
@@ -272,6 +275,22 @@ async def brain_loop() -> None:
             for mkt in markets:
                 thesis = await analyze_market(client, mkt, target_addrs)
                 if thesis is None:
+                    continue
+
+                # Guard against tail shorts. Claude often claims "0%" on
+                # improbable events, but probability=0 is almost never true,
+                # and selling at 0.01 means collecting $0.01 premium against
+                # a $1 liability — asymmetric losses if we're wrong.
+                if (
+                    thesis.direction == Side.SELL
+                    and mkt["midpoint"] < min_sell_price
+                ):
+                    logger.info(
+                        "SKIP %s — tail short filter (mid=%.3f < %.2f)",
+                        mkt["question"][:60],
+                        mkt["midpoint"],
+                        min_sell_price,
+                    )
                     continue
 
                 position_size = size_thesis(thesis, mkt["midpoint"])
