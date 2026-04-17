@@ -45,11 +45,16 @@ def main() -> int:
         return 1
 
     print("Paste your Polygon private key (input hidden, no echo).")
-    print("Format: 0x followed by 64 hex characters.")
-    pk = getpass.getpass("PRIVATE_KEY: ").strip()
+    print("Format: 64 hex characters, with or without a leading 0x.")
+    raw = getpass.getpass("PRIVATE_KEY: ").strip()
+    # MetaMask exports 64 hex chars without 0x — accept both.
+    pk = raw if raw.startswith("0x") else "0x" + raw
 
     if not re.fullmatch(r"0x[0-9a-fA-F]{64}", pk):
-        print("ERROR: that doesn't look like a valid private key (need 0x + 64 hex).", file=sys.stderr)
+        hex_only = pk[2:] if pk.startswith("0x") else pk
+        print("ERROR: that doesn't look like a valid private key.", file=sys.stderr)
+        print(f"  Got {len(hex_only)} hex chars; need exactly 64.", file=sys.stderr)
+        print("  Make sure you copied the full key and didn't grab the seed phrase by mistake.", file=sys.stderr)
         return 1
 
     print("\nConnecting to Polymarket CLOB and deriving API credentials …")
