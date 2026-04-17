@@ -494,6 +494,15 @@ def get_open_positions() -> list[Position]:
     return [p for p in _open_positions if p.is_open]
 
 
+def _deployed_capital() -> float:
+    """Sum of USD still at risk across all open positions."""
+    return sum(p.size for p in _open_positions if p.is_open)
+
+
+def _free_capital() -> float:
+    return BANKROLL - _deployed_capital()
+
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 
@@ -540,6 +549,29 @@ async def executor_loop() -> None:
 
                 if position is None:
                     continue
+
+                # Portfolio-level bankroll gate: Kelly sizes each trade as if
+                # the full BANKROLL were available, so without this we keep
+                # piling on positions until deployed capital exceeds bankroll.
+                free = _free_capital()
+                if free < 5:
+                    logger.info(
+                        "SKIP %s — bankroll fully deployed ($%.2f/$%.2f)",
+                        thesis["question"][:60],
+                        _deployed_capital(),
+                        BANKROLL,
+                    )
+                    continue
+                if position.size > free:
+                    logger.info(
+                        "Trimming %s from $%.2f → $%.2f (bankroll cap; deployed $%.2f/$%.2f)",
+                        thesis["question"][:60],
+                        position.size,
+                        free,
+                        _deployed_capital(),
+                        BANKROLL,
+                    )
+                    position.size = round(free, 2)
 
                 success = await place_order(position)
                 if success:
