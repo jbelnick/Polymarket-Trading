@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 import anthropic
@@ -241,6 +242,12 @@ async def brain_loop() -> None:
     targets = load_targets()
     target_addrs = [t.address for t in targets]
 
+    # Cap how many markets we evaluate per cycle. At ~10s per Claude call,
+    # 30 markets = ~5 min, matching the scanner cycle. Evaluating 140+ would
+    # take 20+ min and the next scan would land before the first thesis.json
+    # ever got written.
+    max_per_cycle = int(os.getenv("BRAIN_MAX_PER_CYCLE", "30"))
+
     while True:
         try:
             markets_path = DATA_DIR / "markets.json"
@@ -250,7 +257,15 @@ async def brain_loop() -> None:
                 continue
 
             markets = json.loads(markets_path.read_text())
-            logger.info("Evaluating %d prescreened markets", len(markets))
+
+            # Work highest-volume first so we don't waste API calls on thin markets.
+            markets.sort(key=lambda m: float(m.get("volume_24h") or 0), reverse=True)
+            markets = markets[:max_per_cycle]
+
+            logger.info(
+                "Evaluating top %d prescreened markets by volume this cycle",
+                len(markets),
+            )
 
             actionable: list[dict] = []
 
@@ -282,8 +297,18 @@ async def brain_loop() -> None:
                         "whale_present": thesis.whale_present,
                     }
                 )
+                # Persist each thesis as we find it so the executor can start
+                # working immediately — don't wait for the full cycle to end.
+                save_theses(actionable)
+                logger.info(
+                    "THESIS %s %s $%.2f conf=%.0f%% — %s",
+                    thesis.direction.value,
+                    ("BUY" if thesis.direction == Side.BUY else "SELL"),
+                    position_size,
+                    thesis.confidence * 100,
+                    mkt["question"][:60],
+                )
 
-            save_theses(actionable)
             logger.info("%d actionable theses this cycle", len(actionable))
 
         except Exception:
