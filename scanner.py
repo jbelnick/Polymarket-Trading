@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -235,11 +236,33 @@ def score_market(market: Market, claude_estimate: float) -> ScoredMarket | None:
 
 # ── Quick pre-screen (no Claude call yet) ─────────────────────────────────────
 
+# Gamma API returns category=null for every market, so the DISABLED_CATEGORIES
+# filter is effectively dead. Infer sports from the question text instead.
+# Each pattern matches as a whole word (except the multi-word ones).
+_SPORTS_PATTERNS = [
+    r"\bvs\.?\b",                 # "Team A vs Team B" (very strong sports signal)
+    r"\bNBA\b", r"\bNFL\b", r"\bMLB\b", r"\bNHL\b", r"\bNCAA\b",
+    r"\bUFC\b", r"\bMMA\b", r"\bATP\b", r"\bWTA\b", r"\bIPL\b",
+    r"\bPremier League\b", r"\bChampions League\b",
+    r"\bLa Liga\b", r"\bBundesliga\b", r"\bSerie A\b",
+    r"\bTennis\b", r"\bGrand Prix\b", r"\bMasters\b",
+    r"\bSpread:", r"\bOver/Under\b",
+    r"Counter-Strike", r"\bCS:GO\b", r"\bDota\b", r"\bValorant\b",
+    r"League of Legends", r"\bIEM\b",
+    r"\bFC\b",                    # football clubs: Chelsea FC, Tottenham Hotspur FC
+]
+
+_SPORTS_RE = re.compile("|".join(_SPORTS_PATTERNS), re.IGNORECASE)
+
+
+def _looks_like_sports(question: str) -> bool:
+    return bool(_SPORTS_RE.search(question or ""))
+
 
 def prescreen_market(market: Market) -> bool:
     """
     Cheap filter before we spend a Claude API call on probability estimation.
-    Checks depth, hours, volume, and category only.
+    Checks depth, hours, volume, category, and a sports-by-keyword heuristic.
     """
     depth = min(market.bids_depth, market.asks_depth)
     if depth < MIN_BOOK_DEPTH:
@@ -251,6 +274,8 @@ def prescreen_market(market: Market) -> bool:
     if market.volume_24h < MIN_MARKET_VOLUME:
         return False
     if market.category in DISABLED_CATEGORIES:
+        return False
+    if "sports" in DISABLED_CATEGORIES and _looks_like_sports(market.question):
         return False
     return True
 

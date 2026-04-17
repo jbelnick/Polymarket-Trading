@@ -46,8 +46,11 @@ MAX_HOURS_TO_RESOLUTION = float(os.getenv("MAX_HOURS", "168"))  # too slow above
 MIN_MARKET_VOLUME = float(os.getenv("MIN_MARKET_VOLUME", "50000"))  # $50K minimum
 
 # ── Brain thresholds ──────────────────────────────────────────────────────────
-MIN_CHECKS_PASSING = int(os.getenv("MIN_CHECKS_PASSING", "3"))  # 3 of 4 checks agree
-MIN_THESIS_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.75"))  # 75%
+# Defaults tuned to what Claude actually produces when given the current
+# prompt (news/whale checks return NEUTRAL most of the time because neither
+# has grounded data). 3/4 + 75% resulted in ~0 theses over a 50-market run.
+MIN_CHECKS_PASSING = int(os.getenv("MIN_CHECKS_PASSING", "2"))  # 2 of 4 checks agree
+MIN_THESIS_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.70"))  # 70%
 
 # ── Kelly sizing ───────────────────────────────────────────────────────────────
 BANKROLL = float(os.getenv("BANKROLL", "800"))
