@@ -49,18 +49,21 @@ def _run_cli(*args: str) -> dict | list:
 
 def fetch_markets(limit: int = MARKET_SCAN_LIMIT) -> list[dict]:
     """
-    Pull the top `limit` markets by 24h volume, filtered to active and open.
+    Pull the `limit` active+open markets resolving soonest.
 
-    Without --order, the CLI returns markets in insertion/id order, which is
-    heavily biased toward long-dated, low-activity markets. Sorting by
-    volume_num descending gives us markets that are actually being traded.
+    The CLI's --order volume_num sorts by lifetime volume, which correlates
+    with how long a market has been open, so it biases toward long-dated
+    markets. --order volume24hr accepts but doesn't sort correctly.
+    --order endDate ascending gets us the soonest-resolving markets, which
+    matches the MIN_HOURS..MAX_HOURS prescreen window.
     """
     return _run_cli(
         "markets",
         "list",
         "--active", "true",
         "--closed", "false",
-        "--order", "volume_num",
+        "--order", "endDate",
+        "--ascending",
         "--limit", str(limit),
     )
 
