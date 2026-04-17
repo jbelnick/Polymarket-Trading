@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import (
@@ -65,24 +66,94 @@ def fetch_midpoint(token_id: str) -> float:
 # ── Market parsing ─────────────────────────────────────────────────────────────
 
 
-def parse_market(raw: dict) -> Market | None:
-    """Convert raw CLI JSON into a Market dataclass. Returns None if unparseable."""
+def _parse_json_list(value) -> list:
+    """The CLI returns some list fields as JSON-encoded strings (e.g. '["Yes","No"]')."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _hours_until(iso_date: str | None) -> float:
+    """Convert an ISO timestamp (e.g. '2026-07-31T12:00:00Z' or '2026-07-31') into hours from now."""
+    if not iso_date:
+        return 0.0
     try:
-        token_id = raw.get("token_id") or raw.get("tokens", [{}])[0].get("token_id", "")
+        dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, delta / 3600)
+
+
+def parse_market(raw: dict) -> Market | None:
+    """Convert a polymarket-cli `markets list` JSON object into a Market. Returns None if unusable."""
+    try:
+        # Skip anything we obviously can't trade
+        if raw.get("closed") or raw.get("archived") or raw.get("active") is False:
+            return None
+        if not raw.get("acceptingOrders", True):
+            return None
+
+        # Token id — CLI returns both outcome tokens as a stringified JSON list.
+        # We take the first (YES) as the canonical token; direction flips happen elsewhere.
+        token_ids = _parse_json_list(raw.get("clobTokenIds") or raw.get("token_ids"))
+        token_id = token_ids[0] if token_ids else raw.get("token_id", "")
         if not token_id:
             return None
 
+        outcomes = _parse_json_list(raw.get("outcomes"))
+
+        # Midpoint — prefer best-bid/ask mean, fall back to last trade.
+        best_bid = float(raw.get("bestBid") or 0)
+        best_ask = float(raw.get("bestAsk") or 0)
+        if best_bid > 0 and best_ask > 0:
+            midpoint = (best_bid + best_ask) / 2
+        else:
+            midpoint = float(raw.get("lastTradePrice") or raw.get("midpoint") or 0)
+
+        # Book depth — CLI gives a single liquidity total, not per-side. Approximate 50/50.
+        # Real bid/ask depth can be fetched per-token with `polymarket clob book <token_id>`
+        # but that's an extra N calls; for the prescreen filter this is close enough.
+        liquidity_total = float(
+            raw.get("liquidityClob") or raw.get("liquidityNum") or raw.get("liquidity") or 0
+        )
+        bids_depth = asks_depth = liquidity_total / 2
+
+        volume_24h = float(
+            raw.get("volume24hr") or raw.get("volume24hrClob") or raw.get("volume_24h") or 0
+        )
+
+        hours_to_resolution = _hours_until(raw.get("endDate") or raw.get("endDateIso"))
+
+        # Category is often null at the top level; try the parent event as a fallback.
+        category = raw.get("category")
+        if not category:
+            events = raw.get("events") or []
+            if events and isinstance(events[0], dict):
+                category = events[0].get("category") or events[0].get("subcategory")
+        category = (category or "").lower()
+
         return Market(
-            condition_id=raw.get("condition_id", ""),
+            condition_id=raw.get("conditionId") or raw.get("condition_id", ""),
             question=raw.get("question", ""),
             token_id=token_id,
-            midpoint=float(raw.get("midpoint", 0) or 0),
-            bids_depth=float(raw.get("bids_depth", 0) or 0),
-            asks_depth=float(raw.get("asks_depth", 0) or 0),
-            volume_24h=float(raw.get("volume_24h", 0) or raw.get("volume", 0) or 0),
-            hours_to_resolution=float(raw.get("hours_to_resolution", 0) or 0),
-            category=raw.get("category", "").lower(),
-            outcomes=raw.get("outcomes", []),
+            midpoint=midpoint,
+            bids_depth=bids_depth,
+            asks_depth=asks_depth,
+            volume_24h=volume_24h,
+            hours_to_resolution=hours_to_resolution,
+            category=category,
+            outcomes=outcomes,
         )
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         logger.debug("Skipping unparseable market: %s", exc)
