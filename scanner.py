@@ -16,6 +16,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from config import (
     DATA_DIR,
     DISABLED_CATEGORIES,
@@ -34,11 +36,15 @@ from models import Market, ScoredMarket
 logger = logging.getLogger(__name__)
 
 
-# ── Polymarket CLI wrappers ────────────────────────────────────────────────────
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+
+
+# ── Polymarket HTTP wrappers ───────────────────────────────────────────────────
 
 
 def _run_cli(*args: str) -> dict | list:
-    """Run a polymarket-cli command and return parsed JSON."""
+    """Run a polymarket-cli command and return parsed JSON. Used for order-book lookups."""
     cmd = [POLYMARKET_CLI, *args, "-o", "json"]
     logger.debug("Running: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -49,33 +55,41 @@ def _run_cli(*args: str) -> dict | list:
 
 def fetch_markets(limit: int = MARKET_SCAN_LIMIT) -> list[dict]:
     """
-    Pull the `limit` active+open markets resolving soonest.
+    Pull the top `limit` active + open markets by 24h volume, resolving in the future.
 
-    The CLI's --order volume_num sorts by lifetime volume, which correlates
-    with how long a market has been open, so it biases toward long-dated
-    markets. --order volume24hr accepts but doesn't sort correctly.
-    --order endDate ascending gets us the soonest-resolving markets, which
-    matches the MIN_HOURS..MAX_HOURS prescreen window.
+    Uses Polymarket's public Gamma API directly rather than the CLI because the
+    CLI cannot filter server-side on `end_date_min` — we'd otherwise get back
+    hundreds of stale markets flagged active=true with endDate in the past.
     """
-    return _run_cli(
-        "markets",
-        "list",
-        "--active", "true",
-        "--closed", "false",
-        "--order", "endDate",
-        "--ascending",
-        "--limit", str(limit),
-    )
+    params = {
+        "active": "true",
+        "closed": "false",
+        "archived": "false",
+        "end_date_min": datetime.now(timezone.utc).isoformat(),
+        "order": "volume24hr",
+        "ascending": "false",
+        "limit": str(limit),
+    }
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(f"{GAMMA_API}/markets", params=params)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def fetch_order_book(token_id: str) -> dict:
-    """Get the order book for a token."""
-    return _run_cli("clob", "book", token_id)
+    """Get the order book for a token from the CLOB."""
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(f"{CLOB_API}/book", params={"token_id": token_id})
+        resp.raise_for_status()
+        return resp.json()
 
 
 def fetch_midpoint(token_id: str) -> float:
-    """Get the current midpoint price for a token."""
-    data = _run_cli("clob", "midpoint", token_id)
+    """Get the current midpoint price for a token from the CLOB."""
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
+        resp.raise_for_status()
+        data = resp.json()
     return float(data.get("mid", data.get("midpoint", 0)))
 
 
