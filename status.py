@@ -106,15 +106,19 @@ def _last_log_events() -> dict:
     return info
 
 
-def fetch_live_prices(token_ids: list[str]) -> dict[str, float]:
-    """Get current midpoint for each token (one HTTP call per)."""
+def fetch_live_prices(token_ids: list[str]) -> dict[str, float | None]:
+    """Get current midpoint for each token (one HTTP call per).
+
+    Returns None for tokens whose fetch failed, so the caller can
+    distinguish a real 0-price from a missing data point.
+    """
     from scanner import fetch_midpoint
-    out = {}
+    out: dict[str, float | None] = {}
     for tid in token_ids:
         try:
             out[tid] = fetch_midpoint(tid)
         except Exception:
-            out[tid] = 0.0
+            out[tid] = None
     return out
 
 
@@ -152,34 +156,49 @@ def render(live: bool = True) -> None:
     # ── Open positions ────────────────────────────────────────────
     print(f"\n  Open positions: {len(open_pos)}")
     if open_pos:
-        live_prices: dict[str, float] = {}
+        live_prices: dict[str, float | None] = {}
         if live:
             print("  fetching live prices …")
             live_prices = fetch_live_prices([p["token_id"] for p in open_pos])
 
         total_unrealized = 0.0
+        missing_prices = 0
         print()
         print("  " + "─" * 74)
         print(f"  {'SIDE':<4} {'SIZE':>7} {'ENTRY':>7} {'NOW':>7} {'PNL':>10} {'HELD':>6}  QUESTION")
         print("  " + "─" * 74)
         for p in open_pos:
             tid = p["token_id"]
-            cur = live_prices.get(tid, 0.0)
+            cur = live_prices.get(tid) if live else None
             shares = p["size"] / p["entry_price"] if p["entry_price"] > 0 else 0
-            if p["side"] == "BUY":
-                unreal = (cur - p["entry_price"]) * shares if cur else 0.0
+            if cur is None:
+                missing_prices += 1
+                now_col = "   ?   "
+                pnl_col = "     ?"
             else:
-                unreal = (p["entry_price"] - cur) * shares if cur else 0.0
-            total_unrealized += unreal
+                if p["side"] == "BUY":
+                    unreal = (cur - p["entry_price"]) * shares
+                else:
+                    unreal = (p["entry_price"] - cur) * shares
+                total_unrealized += unreal
+                now_col = f"{cur:>7.4f}"
+                pnl_col = f"{_money(unreal):>10}"
             held = _fmt_hours(time.time() - p["entry_time"])
             print(
                 f"  {p['side']:<4} ${p['size']:>6.2f} "
-                f"{p['entry_price']:>7.4f} {cur:>7.4f} "
-                f"{_money(unreal):>10} {held:>6}  "
+                f"{p['entry_price']:>7.4f} {now_col} "
+                f"{pnl_col} {held:>6}  "
                 f"{p['question'][:40]}"
             )
         print("  " + "─" * 74)
-        print(f"  {'TOTAL UNREALIZED P&L:':>40} {_money(total_unrealized):>10}")
+        total_label = (
+            f"TOTAL UNREALIZED P&L ({len(open_pos) - missing_prices}/{len(open_pos)}):"
+            if missing_prices
+            else "TOTAL UNREALIZED P&L:"
+        )
+        print(f"  {total_label:>40} {_money(total_unrealized):>10}")
+        if missing_prices:
+            print(f"  ({missing_prices} position(s) excluded — live price unavailable)")
 
     # ── Closed positions summary ──────────────────────────────────
     if closed_pos:
