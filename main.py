@@ -1,16 +1,16 @@
 """
-Polymarket Trading Bot — Main Orchestrator
+Kalshi Trading Bot — Main Orchestrator
 
 Launches all four agents as concurrent async tasks:
   1. Scanner  — scores markets → queue.json
   2. Brain    — evaluates queue → thesis.json
-  3. Executor — consensus + Kelly → trades
+  3. Executor — consensus + Kelly → trades on Kalshi
   4. Exit Mon — volume + target + decay triggers
 
 Usage:
     python main.py                    # run all agents
-    python main.py --scan-only        # scanner only (read-only, no wallet needed)
-    python main.py --analyze <csv>    # analyze wallet data from poly_data
+    python main.py --scan-only        # scanner only (read-only)
+    python main.py --demo             # use Kalshi demo environment
 """
 
 from __future__ import annotations
@@ -18,12 +18,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
-from config import DATA_DIR, LOG_FILE
+from config import DATA_DIR, KALSHI_ENV, LOG_FILE
 
-logger = logging.getLogger("polymarket-bot")
+logger = logging.getLogger("kalshi-bot")
 
 
 def setup_logging() -> None:
@@ -44,68 +45,64 @@ async def run_all() -> None:
     from brain import brain_loop
     from executor import executor_loop, get_open_positions
     from exit_monitor import exit_monitor_loop
+    from kalshi_client import KalshiClient
     from scanner import scan_loop
 
+    client = KalshiClient()
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    env = KALSHI_ENV.upper()
+
+    # Verify connection
+    try:
+        balance = client.get_balance_dollars()
+        logger.info("Connected to Kalshi (%s) — balance: $%.2f", env, balance)
+    except Exception as exc:
+        logger.warning("Could not fetch balance: %s (continuing anyway)", exc)
+
     logger.info("=" * 60)
-    logger.info("Polymarket Trading Bot starting — %s", now)
+    logger.info("Kalshi Trading Bot starting — %s [%s]", now, env)
     logger.info("4 agents going live")
     logger.info("=" * 60)
 
     await asyncio.gather(
-        scan_loop(),
+        scan_loop(client),
         brain_loop(),
-        executor_loop(),
-        exit_monitor_loop(get_open_positions),
+        executor_loop(client),
+        exit_monitor_loop(get_open_positions, client),
     )
 
 
 async def run_scan_only() -> None:
-    """Scanner only — read-only mode, no wallet needed."""
+    """Scanner only — read-only mode."""
+    from kalshi_client import KalshiClient
     from scanner import scan_loop
 
+    client = KalshiClient()
     logger.info("Starting scanner in read-only mode")
-    await scan_loop()
-
-
-def run_analyze(csv_path: str) -> None:
-    """Analyze wallet data from poly_data."""
-    from data_analyzer import analyze_wallets, save_targets
-
-    targets = analyze_wallets(csv_path)
-    save_targets(targets)
-
-    print(f"\nFound {len(targets)} target wallets")
-    if targets:
-        print(f"\nTop 10 by PnL:")
-        for i, t in enumerate(targets[:10], 1):
-            print(
-                f"  {i:2d}. {t.address[:12]}…  "
-                f"trades={t.trades:>5d}  "
-                f"win_rate={t.win_rate:.1%}  "
-                f"pnl=${t.total_pnl:>12,.2f}"
-            )
+    await scan_loop(client)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
+    parser = argparse.ArgumentParser(description="Kalshi Trading Bot")
     parser.add_argument(
         "--scan-only",
         action="store_true",
-        help="Run scanner only (read-only, no wallet needed)",
+        help="Run scanner only (read-only)",
     )
     parser.add_argument(
-        "--analyze",
-        metavar="CSV",
-        help="Analyze wallet data from poly_data trades CSV",
+        "--demo",
+        action="store_true",
+        help="Force demo environment (overrides KALSHI_ENV)",
     )
     args = parser.parse_args()
 
+    if args.demo:
+        os.environ["KALSHI_ENV"] = "demo"
+
     setup_logging()
 
-    if args.analyze:
-        run_analyze(args.analyze)
-    elif args.scan_only:
+    if args.scan_only:
         asyncio.run(run_scan_only())
     else:
         asyncio.run(run_all())

@@ -1,10 +1,10 @@
 """
-Polymarket Trading Bot — Step 3: The Executor
+Kalshi Trading Bot — Step 3: The Executor
 
 Three independent strategy agents evaluate each thesis:
   1. Arbitrage  — catches price gaps between related markets
   2. Convergence — enters when price moves toward Claude's estimate
-  3. Whale Copy  — mirrors the 47 target wallets with 60s delay
+  3. Volume Profile — confirms via volume/OI patterns
 
 Consensus logic:
   - 2+ agents agree → full position
@@ -27,10 +27,9 @@ from config import (
     DATA_DIR,
     THESIS_FILE,
     TRADES_LOG,
-    WHALE_COPY_DELAY_SEC,
 )
-from data_analyzer import load_targets
-from models import AgentType, AgentVote, Position, Side
+from kalshi_client import KalshiClient
+from models import Action, AgentType, AgentVote, Position, Side
 
 logger = logging.getLogger(__name__)
 
@@ -50,38 +49,38 @@ class BaseAgent:
 class ArbitrageAgent(BaseAgent):
     """
     Catches price gaps between related markets.
-    If the thesis market is mispriced relative to correlated markets,
+    If the thesis market is mispriced relative to Claude's estimate,
     this agent votes to trade.
     """
 
     agent_type = AgentType.ARBITRAGE
 
     def evaluate(self, thesis: dict, context: dict) -> AgentVote:
-        gap = abs(thesis["probability"] - thesis["midpoint"])
+        gap = abs(thesis["probability"] - thesis["yes_price"])
         confidence = thesis["confidence"]
 
-        # Arbitrage signal: large gap + high confidence = strong buy
         if gap >= 0.10 and confidence >= 0.80:
             return AgentVote(
                 agent=self.agent_type,
-                action=Side.BUY if thesis["direction"] == "BUY" else Side.SELL,
+                action=Action(thesis["action"]),
+                side=Side(thesis["side"]),
                 confidence=confidence,
                 reasoning=f"Arbitrage: {gap:.1%} gap with {confidence:.0%} confidence",
             )
 
-        # Moderate signal
         if gap >= 0.07 and confidence >= 0.75:
             return AgentVote(
                 agent=self.agent_type,
-                action=Side.BUY if thesis["direction"] == "BUY" else Side.SELL,
+                action=Action(thesis["action"]),
+                side=Side(thesis["side"]),
                 confidence=confidence * 0.8,
                 reasoning=f"Arbitrage: moderate {gap:.1%} gap",
             )
 
-        # No signal — vote against
         return AgentVote(
             agent=self.agent_type,
-            action=Side.SELL if thesis["direction"] == "BUY" else Side.BUY,
+            action=Action.SELL if thesis["action"] == "buy" else Action.BUY,
+            side=Side(thesis["side"]),
             confidence=0.0,
             reasoning="Arbitrage: gap too thin or confidence too low",
         )
@@ -90,72 +89,74 @@ class ArbitrageAgent(BaseAgent):
 class ConvergenceAgent(BaseAgent):
     """
     Enters when price is already moving toward Claude's estimate.
-    Momentum confirmation reduces the chance of catching a falling knife.
+    Momentum confirmation reduces false signals.
     """
 
     agent_type = AgentType.CONVERGENCE
 
     def evaluate(self, thesis: dict, context: dict) -> AgentVote:
         probability = thesis["probability"]
-        midpoint = thesis["midpoint"]
-        direction = thesis["direction"]
+        yes_price = thesis["yes_price"]
 
-        # Check if price is converging toward the estimate
-        # (i.e., market is starting to agree with Claude)
-        if direction == "BUY" and midpoint < probability:
-            # Price below estimate — convergence would mean price rising
-            convergence_strength = probability - midpoint
-            return AgentVote(
-                agent=self.agent_type,
-                action=Side.BUY,
-                confidence=min(convergence_strength * 5, 1.0),  # scale to [0, 1]
-                reasoning=f"Convergence: price {midpoint:.2f} → estimate {probability:.2f}",
-            )
+        if thesis["side"] == "yes" and thesis["action"] == "buy":
+            if yes_price < probability:
+                strength = probability - yes_price
+                return AgentVote(
+                    agent=self.agent_type,
+                    action=Action.BUY,
+                    side=Side.YES,
+                    confidence=min(strength * 5, 1.0),
+                    reasoning=f"Convergence: YES price {yes_price:.2f} → estimate {probability:.2f}",
+                )
 
-        if direction == "SELL" and midpoint > probability:
-            convergence_strength = midpoint - probability
-            return AgentVote(
-                agent=self.agent_type,
-                action=Side.SELL,
-                confidence=min(convergence_strength * 5, 1.0),
-                reasoning=f"Convergence: price {midpoint:.2f} → estimate {probability:.2f}",
-            )
+        if thesis["side"] == "no" and thesis["action"] == "buy":
+            no_price = 1 - yes_price
+            no_estimate = 1 - probability
+            if no_price < no_estimate:
+                strength = no_estimate - no_price
+                return AgentVote(
+                    agent=self.agent_type,
+                    action=Action.BUY,
+                    side=Side.NO,
+                    confidence=min(strength * 5, 1.0),
+                    reasoning=f"Convergence: NO price {no_price:.2f} → estimate {no_estimate:.2f}",
+                )
 
         return AgentVote(
             agent=self.agent_type,
-            action=Side.SELL if direction == "BUY" else Side.BUY,
+            action=Action.SELL if thesis["action"] == "buy" else Action.BUY,
+            side=Side(thesis["side"]),
             confidence=0.0,
             reasoning="Convergence: no momentum confirmation",
         )
 
 
-class WhaleCopyAgent(BaseAgent):
+class VolumeProfileAgent(BaseAgent):
     """
-    Mirrors the 47 target wallets with a 60-second delay.
-    If a known profitable wallet is active in this market, vote to follow.
+    Confirms via volume and open interest signals.
+    High volume + increasing OI on the thesis side = smart money accumulating.
     """
 
-    agent_type = AgentType.WHALE_COPY
-
-    def __init__(self, target_addresses: list[str] | None = None):
-        self.target_addresses = target_addresses or []
+    agent_type = AgentType.VOLUME_PROFILE
 
     def evaluate(self, thesis: dict, context: dict) -> AgentVote:
-        whale_present = thesis.get("whale_present", False)
+        volume_signal = thesis.get("volume_signal", False)
 
-        if whale_present:
+        if volume_signal:
             return AgentVote(
                 agent=self.agent_type,
-                action=Side.BUY if thesis["direction"] == "BUY" else Side.SELL,
-                confidence=0.85,
-                reasoning="Whale copy: target wallet active in this market",
+                action=Action(thesis["action"]),
+                side=Side(thesis["side"]),
+                confidence=0.80,
+                reasoning="Volume: smart money signal detected",
             )
 
         return AgentVote(
             agent=self.agent_type,
-            action=Side.SELL if thesis["direction"] == "BUY" else Side.BUY,
+            action=Action.SELL if thesis["action"] == "buy" else Action.BUY,
+            side=Side(thesis["side"]),
             confidence=0.0,
-            reasoning="Whale copy: no target wallet activity detected",
+            reasoning="Volume: no accumulation signal",
         )
 
 
@@ -165,26 +166,29 @@ class WhaleCopyAgent(BaseAgent):
 def compute_consensus(
     votes: list[AgentVote],
     thesis: dict,
-) -> tuple[Side | None, float]:
+) -> tuple[Action | None, Side | None, float]:
     """
     Consensus logic:
-      2+ agents agree with thesis direction → full position size
-      1 agent agrees                        → half position size
-      0 agents agree                        → no trade (None)
+      2+ agents agree with thesis → full position size
+      1 agent agrees              → half position size
+      0 agents agree              → no trade (None)
 
-    Returns (side, size_multiplier).
+    Returns (action, side, size_multiplier).
     """
-    thesis_side = Side.BUY if thesis["direction"] == "BUY" else Side.SELL
+    thesis_action = Action(thesis["action"])
+    thesis_side = Side(thesis["side"])
 
-    agreeing = [v for v in votes if v.action == thesis_side and v.confidence > 0]
-    buy_votes = len(agreeing)
+    agreeing = [
+        v for v in votes
+        if v.action == thesis_action and v.side == thesis_side and v.confidence > 0
+    ]
 
-    if buy_votes >= CONSENSUS_FULL:
-        return thesis_side, 1.0
-    elif buy_votes >= CONSENSUS_HALF:
-        return thesis_side, 0.5
+    if len(agreeing) >= CONSENSUS_FULL:
+        return thesis_action, thesis_side, 1.0
+    elif len(agreeing) >= CONSENSUS_HALF:
+        return thesis_action, thesis_side, 0.5
     else:
-        return None, 0.0
+        return None, None, 0.0
 
 
 async def execute_consensus(
@@ -194,80 +198,90 @@ async def execute_consensus(
 ) -> Position | None:
     """
     Run all agents, compute consensus, and build a Position if actionable.
-    Does NOT place the order on-chain — returns the Position for the caller
-    to submit via the Polymarket CLOB API.
     """
     votes = [agent.evaluate(thesis, context) for agent in agents]
 
     for v in votes:
         logger.info(
-            "  %s → %s (conf=%.0f%%) — %s",
+            "  %s → %s %s (conf=%.0f%%) — %s",
             v.agent.value,
             v.action.value,
+            v.side.value,
             v.confidence * 100,
             v.reasoning,
         )
 
-    side, multiplier = compute_consensus(votes, thesis)
+    action, side, multiplier = compute_consensus(votes, thesis)
 
-    if side is None:
+    if action is None:
         logger.info("  CONSENSUS: no trade — agents disagree")
         return None
 
-    base_size = thesis["position_size"]
-    final_size = round(base_size * multiplier, 2)
-
-    if final_size <= 0:
-        return None
+    base_contracts = thesis["contract_count"]
+    final_contracts = max(1, int(base_contracts * multiplier))
+    price = thesis["price_cents"] / 100
 
     logger.info(
-        "  CONSENSUS: %s $%.2f (%s position)",
-        side.value,
-        final_size,
+        "  CONSENSUS: %s %s %d contracts @ $%.2f (%s position)",
+        action.value.upper(),
+        side.value.upper(),
+        final_contracts,
+        price,
         "full" if multiplier == 1.0 else "half",
     )
 
-    # Build the position (not yet submitted on-chain)
-    expected_gap = abs(thesis["probability"] - thesis["midpoint"])
+    expected_gap = abs(thesis["probability"] - thesis["yes_price"])
 
     return Position(
-        market_id=thesis.get("condition_id", ""),
-        token_id=thesis.get("token_id", ""),
-        question=thesis["question"],
+        ticker=thesis["ticker"],
+        title=thesis["title"],
+        action=action,
         side=side,
-        entry_price=thesis["midpoint"],
-        size=final_size,
+        entry_price=price,
+        count=final_contracts,
         expected_gap=expected_gap,
     )
 
 
-# ── Order placement stub ──────────────────────────────────────────────────────
+# ── Order placement (LIVE — Kalshi CLOB) ──────────────────────────────────────
 
 
-async def place_order(position: Position) -> bool:
+async def place_order(client: KalshiClient, position: Position) -> bool:
     """
-    Submit an order to the Polymarket CLOB.
-
-    This is a stub — in production, wire this up to the polymarket-cli
-    or the py-clob-client SDK:
-
-        from py_clob_client.client import ClobClient
-        client = ClobClient(host, key=API_KEY, ...)
-        client.create_and_post_order(...)
-
-    Returns True if order was accepted.
+    Submit an order to the Kalshi exchange.
+    Returns True if the order was accepted.
     """
-    logger.info(
-        "ORDER: %s %s $%.2f @ %.4f — %s",
-        position.side.value,
-        position.token_id[:12],
-        position.size,
-        position.entry_price,
-        position.question[:60],
-    )
-    # TODO: Replace with real CLOB order submission
-    # For now, log and return success
-    return True
+    try:
+        price_cents = int(position.entry_price * 100)
+
+        result = client.place_order(
+            ticker=position.ticker,
+            action=position.action.value,
+            side=position.side.value,
+            count=position.count,
+            type="limit",
+            yes_price=price_cents if position.side == Side.YES else None,
+            no_price=price_cents if position.side == Side.NO else None,
+        )
+
+        order = result.get("order", result)
+        position.order_id = order.get("order_id", "")
+
+        logger.info(
+            "ORDER PLACED: %s %s %s %d @ %dc — %s (id=%s)",
+            position.action.value.upper(),
+            position.side.value.upper(),
+            position.ticker,
+            position.count,
+            price_cents,
+            position.title[:50],
+            position.order_id[:12] if position.order_id else "?",
+        )
+        return True
+
+    except Exception as exc:
+        logger.error("Order failed for %s: %s", position.ticker, exc)
+        return False
 
 
 # ── Trade log ──────────────────────────────────────────────────────────────────
@@ -284,14 +298,15 @@ def log_trade(position: Position) -> None:
 
     trades.append(
         {
-            "market_id": position.market_id,
-            "token_id": position.token_id,
-            "question": position.question,
+            "ticker": position.ticker,
+            "title": position.title,
+            "action": position.action.value,
             "side": position.side.value,
             "entry_price": position.entry_price,
-            "size": position.size,
+            "count": position.count,
             "expected_gap": position.expected_gap,
             "entry_time": position.entry_time,
+            "order_id": position.order_id,
         }
     )
     log_path.write_text(json.dumps(trades, indent=2))
@@ -309,20 +324,20 @@ def get_open_positions() -> list[Position]:
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 
-async def executor_loop() -> None:
+async def executor_loop(client: KalshiClient | None = None) -> None:
     """
     Continuous execution loop.
-    Reads thesis.json, runs consensus, places orders.
+    Reads thesis.json, runs consensus, places orders on Kalshi.
     """
     logger.info("Executor starting")
 
-    targets = load_targets()
-    target_addrs = [t.address for t in targets]
+    if client is None:
+        client = KalshiClient()
 
     agents: list[BaseAgent] = [
         ArbitrageAgent(),
         ConvergenceAgent(),
-        WhaleCopyAgent(target_addresses=target_addrs),
+        VolumeProfileAgent(),
     ]
 
     already_traded: set[str] = set()
@@ -337,24 +352,22 @@ async def executor_loop() -> None:
             theses = json.loads(THESIS_FILE.read_text())
 
             for thesis in theses:
-                market_id = thesis.get("condition_id", thesis.get("token_id", ""))
-
-                if market_id in already_traded:
+                ticker = thesis.get("ticker", "")
+                if ticker in already_traded:
                     continue
 
-                logger.info("Evaluating: %s", thesis["question"][:70])
+                logger.info("Evaluating: %s", thesis["title"][:70])
 
                 position = await execute_consensus(agents, thesis, context={})
-
                 if position is None:
                     continue
 
-                success = await place_order(position)
+                success = await place_order(client, position)
                 if success:
                     _open_positions.append(position)
                     log_trade(position)
-                    already_traded.add(market_id)
-                    logger.info("TRADE PLACED: %s", thesis["question"][:70])
+                    already_traded.add(ticker)
+                    logger.info("TRADE PLACED: %s", thesis["title"][:70])
 
         except Exception:
             logger.exception("Executor cycle failed")

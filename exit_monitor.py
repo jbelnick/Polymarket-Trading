@@ -1,14 +1,13 @@
 """
-Polymarket Trading Bot — Step 4: Exit Monitor
+Kalshi Trading Bot — Step 4: Exit Monitor
 
-Three exit triggers — the part nobody talks about:
+Three exit triggers:
 
   1. TARGET HIT  — take profit at 85% of expected move
   2. VOLUME SPIKE — 3× normal volume = smart money leaving
   3. STALE THESIS — thesis is stale after 24h with <2% price move
 
-91% of exits from top wallets happen BEFORE resolution.
-Average exit: 73% of max potential profit captured.
+Top traders don't hold to settlement — they capture ~73% of max profit and move on.
 """
 
 from __future__ import annotations
@@ -29,52 +28,43 @@ from config import (
     TRADES_LOG,
     VOLUME_SPIKE_MULTIPLIER,
 )
-from models import ExitReason, Position, Side
-from scanner import fetch_midpoint
+from kalshi_client import KalshiClient
+from models import Action, ExitReason, Position, Side
 
 logger = logging.getLogger(__name__)
 
 
 # ── Volume tracking ────────────────────────────────────────────────────────────
 
-# Rolling window of 10-minute volume samples per token
 _volume_history: dict[str, list[tuple[float, float]]] = defaultdict(list)
 _VOLUME_WINDOW_SEC = 600  # 10 minutes
 
 
-def record_volume(token_id: str, volume: float) -> None:
-    """Record a volume data point for a token."""
+def record_volume(ticker: str, volume: float) -> None:
     now = time.time()
-    _volume_history[token_id].append((now, volume))
-    # Prune old entries (keep last hour)
+    _volume_history[ticker].append((now, volume))
     cutoff = now - 3600
-    _volume_history[token_id] = [
-        (t, v) for t, v in _volume_history[token_id] if t > cutoff
+    _volume_history[ticker] = [
+        (t, v) for t, v in _volume_history[ticker] if t > cutoff
     ]
 
 
-def get_avg_volume_10min(token_id: str) -> float:
-    """Average volume per 10-minute window over the last hour."""
-    history = _volume_history.get(token_id, [])
+def get_avg_volume_10min(ticker: str) -> float:
+    history = _volume_history.get(ticker, [])
     if len(history) < 2:
-        return float("inf")  # not enough data — don't trigger
-
-    # Sum volume deltas across the history
+        return float("inf")
     total_volume = sum(v for _, v in history)
     time_span = history[-1][0] - history[0][0]
-
     if time_span <= 0:
         return float("inf")
-
     windows = time_span / _VOLUME_WINDOW_SEC
     return total_volume / max(windows, 1)
 
 
-def get_recent_volume_10min(token_id: str) -> float:
-    """Volume in the most recent 10-minute window."""
+def get_recent_volume_10min(ticker: str) -> float:
     now = time.time()
     cutoff = now - _VOLUME_WINDOW_SEC
-    history = _volume_history.get(token_id, [])
+    history = _volume_history.get(ticker, [])
     return sum(v for t, v in history if t > cutoff)
 
 
@@ -82,11 +72,8 @@ def get_recent_volume_10min(token_id: str) -> float:
 
 
 def check_target_hit(position: Position, current_price: float) -> bool:
-    """
-    Exit trigger #1: Take profit at 85% of expected move.
-    Top wallets don't hold to settlement — they capture 73% on average.
-    """
-    if position.side == Side.BUY:
+    """Exit trigger #1: Take profit at 85% of expected move."""
+    if position.action == Action.BUY:
         target = position.entry_price + (position.expected_gap * TARGET_PROFIT_FRACTION)
         return current_price >= target
     else:
@@ -95,81 +82,84 @@ def check_target_hit(position: Position, current_price: float) -> bool:
 
 
 def check_volume_spike(position: Position) -> bool:
-    """
-    Exit trigger #2: Volume spike — 3× normal = smart money leaving.
-    This is the exit trigger nobody talks about.
-    """
-    avg = get_avg_volume_10min(position.token_id)
-    recent = get_recent_volume_10min(position.token_id)
-
+    """Exit trigger #2: Volume spike — 3× normal = smart money leaving."""
+    avg = get_avg_volume_10min(position.ticker)
+    recent = get_recent_volume_10min(position.ticker)
     if avg == float("inf") or avg <= 0:
         return False
-
     return recent > avg * VOLUME_SPIKE_MULTIPLIER
 
 
 def check_stale_thesis(position: Position, current_price: float) -> bool:
-    """
-    Exit trigger #3: Thesis is stale after 24h with <2% price move.
-    If nothing happened, the edge is probably gone.
-    """
+    """Exit trigger #3: Thesis is stale after 24h with <2% price move."""
     if position.hours_held < STALE_THESIS_HOURS:
         return False
-
     price_change = abs(current_price - position.entry_price)
     return price_change < STALE_PRICE_THRESHOLD
 
 
 def evaluate_exit(position: Position, current_price: float) -> ExitReason | None:
-    """
-    Run all three exit checks. Returns the first triggered reason, or None.
-    Priority: target hit > volume spike > stale thesis.
-    """
+    """Run all three exit checks. Returns the first triggered reason, or None."""
     if check_target_hit(position, current_price):
         return ExitReason.TARGET_HIT
-
     if check_volume_spike(position):
         return ExitReason.VOLUME_EXIT
-
     if check_stale_thesis(position, current_price):
         return ExitReason.STALE_THESIS
-
     return None
 
 
 # ── Exit execution ─────────────────────────────────────────────────────────────
 
 
-async def close_position(position: Position, reason: ExitReason, exit_price: float) -> bool:
+async def close_position(
+    client: KalshiClient,
+    position: Position,
+    reason: ExitReason,
+    exit_price: float,
+) -> bool:
     """
-    Close an open position.
-
-    Stub — in production, submit a sell/buy order via polymarket-cli or
-    the py-clob-client SDK.
+    Close an open position by placing an opposing order on Kalshi.
+    BUY position → SELL to close.
     """
-    position.exit_price = exit_price
-    position.exit_time = time.time()
-    position.exit_reason = reason
+    try:
+        close_action = "sell" if position.action == Action.BUY else "buy"
+        price_cents = int(exit_price * 100)
 
-    # Calculate PnL
-    if position.side == Side.BUY:
-        position.pnl = round((exit_price - position.entry_price) * position.size, 2)
-    else:
-        position.pnl = round((position.entry_price - exit_price) * position.size, 2)
+        client.place_order(
+            ticker=position.ticker,
+            action=close_action,
+            side=position.side.value,
+            count=position.count,
+            type="limit",
+            yes_price=price_cents if position.side == Side.YES else None,
+            no_price=price_cents if position.side == Side.NO else None,
+        )
 
-    logger.info(
-        "EXIT %s: %s — entry=%.4f exit=%.4f pnl=$%.2f held=%.1fh — %s",
-        reason.value,
-        position.question[:50],
-        position.entry_price,
-        exit_price,
-        position.pnl,
-        position.hours_held,
-        position.token_id[:12],
-    )
+        position.exit_price = exit_price
+        position.exit_time = time.time()
+        position.exit_reason = reason
 
-    # TODO: Submit actual sell order to CLOB
-    return True
+        if position.action == Action.BUY:
+            position.pnl = round((exit_price - position.entry_price) * position.count, 2)
+        else:
+            position.pnl = round((position.entry_price - exit_price) * position.count, 2)
+
+        logger.info(
+            "EXIT %s: %s — entry=$%.2f exit=$%.2f pnl=$%.2f held=%.1fh — %s",
+            reason.value,
+            position.title[:50],
+            position.entry_price,
+            exit_price,
+            position.pnl,
+            position.hours_held,
+            position.ticker,
+        )
+        return True
+
+    except Exception as exc:
+        logger.error("Failed to close %s: %s", position.ticker, exc)
+        return False
 
 
 def update_trade_log(position: Position) -> None:
@@ -180,7 +170,7 @@ def update_trade_log(position: Position) -> None:
 
     trades = json.loads(log_path.read_text())
     for trade in trades:
-        if trade.get("token_id") == position.token_id and "exit_price" not in trade:
+        if trade.get("ticker") == position.ticker and "exit_price" not in trade:
             trade["exit_price"] = position.exit_price
             trade["exit_time"] = position.exit_time
             trade["exit_reason"] = position.exit_reason.value if position.exit_reason else None
@@ -195,7 +185,6 @@ def update_trade_log(position: Position) -> None:
 
 
 def compute_stats(positions: list[Position]) -> dict:
-    """Compute aggregate trading statistics."""
     closed = [p for p in positions if not p.is_open and p.pnl is not None]
     if not closed:
         return {"trades": 0}
@@ -223,12 +212,12 @@ def compute_stats(positions: list[Position]) -> dict:
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 
-async def exit_monitor_loop(get_positions_fn) -> None:
-    """
-    Continuous exit monitoring loop.
-    Checks every open position against all exit triggers.
-    """
+async def exit_monitor_loop(get_positions_fn, client: KalshiClient | None = None) -> None:
+    """Continuous exit monitoring loop."""
     logger.info("Exit monitor starting — interval %ds", EXIT_CHECK_INTERVAL_SEC)
+
+    if client is None:
+        client = KalshiClient()
 
     while True:
         try:
@@ -243,19 +232,21 @@ async def exit_monitor_loop(get_positions_fn) -> None:
 
             for position in open_positions:
                 try:
-                    current_price = fetch_midpoint(position.token_id)
+                    current_price = client.get_midpoint(position.ticker)
+
+                    # Record volume for spike detection
+                    market = client.get_market(position.ticker)
+                    vol = market.get("volume_24h", market.get("volume", 0))
+                    record_volume(position.ticker, vol)
+
                 except Exception as exc:
-                    logger.warning(
-                        "Failed to fetch price for %s: %s",
-                        position.token_id[:12],
-                        exc,
-                    )
+                    logger.warning("Failed to fetch data for %s: %s", position.ticker, exc)
                     continue
 
                 reason = evaluate_exit(position, current_price)
 
                 if reason is not None:
-                    success = await close_position(position, reason, current_price)
+                    success = await close_position(client, position, reason, current_price)
                     if success:
                         update_trade_log(position)
 
@@ -267,8 +258,5 @@ async def exit_monitor_loop(get_positions_fn) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-
-    # When run standalone, import positions from executor
     from executor import get_open_positions
-
     asyncio.run(exit_monitor_loop(get_open_positions))

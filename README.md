@@ -1,6 +1,6 @@
-# Polymarket Trading Bot
+# Kalshi Trading Bot
 
-A Claude-powered prediction market trading bot that runs 24/7 on a $5 VPS. Four async agents scan, analyze, trade, and exit — fully automated.
+A Claude-powered prediction market trading bot for [Kalshi](https://kalshi.com) — the CFTC-regulated US prediction market exchange. Four async agents scan, analyze, trade, and exit — fully automated.
 
 **Total cost: ~$25/month** (Claude API + VPS)
 
@@ -10,9 +10,9 @@ A Claude-powered prediction market trading bot that runs 24/7 on a $5 VPS. Four 
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │   Scanner   │────▶│    Brain    │────▶│  Executor   │────▶│ Exit Monitor│
 │             │     │             │     │             │     │             │
-│ polymarket- │     │ Claude API  │     │ 3 strategy  │     │ 3 triggers: │
-│ cli pulls   │     │ runs 4      │     │ agents vote │     │ target hit, │
-│ 500 markets │     │ checks per  │     │ on each     │     │ volume      │
+│ Kalshi API  │     │ Claude API  │     │ 3 strategy  │     │ 3 triggers: │
+│ pulls open  │     │ runs 4      │     │ agents vote │     │ target hit, │
+│ markets,    │     │ checks per  │     │ on each     │     │ volume      │
 │ filters 93% │     │ market      │     │ thesis      │     │ spike,      │
 │             │     │ Kelly sizes │     │             │     │ stale thesis│
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
@@ -21,22 +21,16 @@ A Claude-powered prediction market trading bot that runs 24/7 on a $5 VPS. Four 
 
 ## How It Works
 
-### Step 0 — Find Who's Winning
-`data_analyzer.py` crunches historical trade data from [poly_data](https://github.com/warproxxx/poly_data) (86M+ trades). Finds every wallet with 100+ trades and >70% win rate, ranks by profit, exports top 50 as target wallets.
-
-```bash
-python main.py --analyze ~/poly_data/processed/trades.csv
-```
-
 ### Step 1 — Scan for Opportunities
-`scanner.py` pulls 500 active markets via [polymarket-cli](https://github.com/Polymarket/polymarket-cli) and kills 93% with hard filters:
+`scanner.py` pulls open markets via the Kalshi REST API and kills 93% with hard filters:
 
 | Filter | Threshold | Why |
 |--------|-----------|-----|
 | Edge gap | < 7% mispricing | Not worth the risk |
 | Book depth | < $500 both sides | Can't fill without slippage |
 | Time to resolution | < 4h or > 7 days | Too late or too slow |
-| 24h volume | < $50K | Slippage eats the edge |
+| 24h volume | < 50K contracts | Slippage eats the edge |
+| Price range | < $0.03 or > $0.97 | Too close to settlement |
 | Category | Sports | 52% win rate — not profitable |
 
 ### Step 2 — Claude Decides
@@ -44,7 +38,7 @@ python main.py --analyze ~/poly_data/processed/trades.csv
 
 1. **Base rate** — historical stats and prior probabilities
 2. **News** — anything material in the last 6 hours?
-3. **Whale check** — are target wallets active in this market?
+3. **Volume / OI** — is smart money accumulating?
 4. **Disposition** — is the crowd making a cognitive error?
 
 **3 of 4 must agree.** Confidence must exceed 75%. Position sizing uses the Kelly criterion capped at quarter-Kelly.
@@ -64,35 +58,33 @@ def kelly_size(p_win, market_price, bankroll, max_fraction=0.25):
 
 | Agent | Strategy |
 |-------|----------|
-| **Arbitrage** | Catches price gaps between related markets |
-| **Convergence** | Enters when price moves toward Claude's estimate |
-| **Whale Copy** | Mirrors target wallets with 60s delay |
+| **Arbitrage** | Catches price gaps vs Claude's estimate |
+| **Convergence** | Enters when price moves toward estimate |
+| **Volume Profile** | Confirms via volume/OI accumulation patterns |
 
 **Consensus rules:**
 - 2+ agents agree → full position
 - 1 agent → half position
 - 0 agents → no trade
 
-This filter alone kills 40% of losing trades.
+Orders are placed **live** on Kalshi via their REST API with RSA-PSS authentication.
 
 ### Step 4 — Know When to Leave
 `exit_monitor.py` runs 3 exit triggers:
 
 | Trigger | Condition | Insight |
 |---------|-----------|---------|
-| **Target hit** | 85% of expected move captured | Top wallets capture ~73% avg, don't hold to settlement |
-| **Volume spike** | 3× normal 10-min volume | Smart money is leaving |
+| **Target hit** | 85% of expected move captured | Don't hold to settlement |
+| **Volume spike** | 3x normal 10-min volume | Smart money is leaving |
 | **Stale thesis** | 24h held, < 2% price move | Edge is gone |
-
-**Key finding from data:** 91% of top-wallet exits happen *before* resolution. They buy at 40¢, sell at 65¢, and move on.
 
 ## Quick Start
 
 ### Prerequisites
 - Python 3.11+
-- [polymarket-cli](https://github.com/Polymarket/polymarket-cli) installed
+- Kalshi account with API access
+- RSA key pair (generate at [kalshi.com/account/api](https://kalshi.com/account/api))
 - Anthropic API key
-- Polymarket wallet (private key + API credentials)
 
 ### Install
 
@@ -101,33 +93,40 @@ git clone https://github.com/jbelnick/Polymarket-Trading.git
 cd Polymarket-Trading
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your keys
+# Edit .env with your API keys and private key path
 ```
+
+### Generate Kalshi API Keys
+
+1. Go to [kalshi.com/account/api](https://kalshi.com/account/api)
+2. Create an API key — you'll get a **Key ID** and download a **private key PEM file**
+3. Save the PEM file somewhere safe (e.g. `~/.kalshi/private_key.pem`)
+4. Add both to your `.env` file
 
 ### Run
 
 ```bash
-# Full bot — all 4 agents
-python main.py
+# Demo mode first (paper trading, no real money)
+python main.py --demo
 
-# Scanner only (read-only, no wallet needed)
+# Scanner only (read-only, see what the bot would do)
 python main.py --scan-only
 
-# Analyze wallet data first
-python main.py --analyze ~/poly_data/processed/trades.csv
+# Full bot — all 4 agents, live trading
+python main.py
 ```
 
-### VPS Deployment (cron)
+### VPS Deployment
 
 ```bash
-# Run daily at 06:00 UTC
+# cron — daily at 06:00 UTC
 crontab -e
-0 6 * * * /path/to/Polymarket-Trading/start.sh >> /path/to/cron.log 2>&1
+0 6 * * * /path/to/start.sh >> /path/to/cron.log 2>&1
 ```
 
 Or keep it running in a screen session:
 ```bash
-screen -S polybot
+screen -S kalshi-bot
 ./start.sh
 # Ctrl+A, D to detach
 ```
@@ -138,16 +137,22 @@ All parameters are tunable via environment variables in `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `KALSHI_API_KEY_ID` | — | Kalshi API key ID (required) |
+| `KALSHI_PRIVATE_KEY_PATH` | — | Path to RSA private key PEM (required) |
+| `KALSHI_ENV` | `demo` | `demo` for paper trading, `prod` for real money |
 | `ANTHROPIC_API_KEY` | — | Claude API key (required) |
-| `POLYMARKET_PRIVATE_KEY` | — | Wallet private key (required for trading) |
 | `BANKROLL` | `800` | Total capital in USD |
-| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Claude model for analysis |
+| `CLAUDE_MODEL_FAST` | `claude-haiku-4-5-20251001` | Haiku for pre-screening |
+| `CLAUDE_MODEL_DEEP` | `claude-sonnet-4-20250514` | Sonnet for full analysis |
 | `MIN_EDGE_GAP` | `0.07` | Minimum mispricing (7%) |
 | `MIN_BOOK_DEPTH` | `500` | Minimum order book depth ($) |
-| `MIN_MARKET_VOLUME` | `50000` | Minimum 24h volume ($) |
+| `MIN_MARKET_VOLUME` | `50000` | Minimum 24h volume (contracts) |
 | `MAX_KELLY` | `0.25` | Kelly fraction cap (quarter-Kelly) |
 | `DISABLED_CATEGORIES` | `sports` | Comma-separated categories to skip |
-| `SCAN_INTERVAL` | `300` | Seconds between market scans |
+| `SCAN_INTERVAL` | `1800` | Seconds between market scans (30 min) |
+| `BRAIN_INTERVAL` | `7200` | Seconds between Claude analyses (2 hours — cost control) |
+| `EXIT_INTERVAL` | `30` | Seconds between exit trigger checks |
+| `CACHE_TTL` | `3600` | Seconds before re-analyzing a market |
 | `STALE_HOURS` | `24` | Hours before a thesis goes stale |
 
 ## File Structure
@@ -156,43 +161,49 @@ All parameters are tunable via environment variables in `.env`:
 ├── main.py              # Orchestrator — launches all 4 agents
 ├── config.py            # All tunable parameters
 ├── models.py            # Shared dataclasses (Market, Position, Thesis, etc.)
-├── data_analyzer.py     # Step 0: Wallet profiling from poly_data
+├── kalshi_client.py     # Kalshi API client with RSA-PSS auth
 ├── scanner.py           # Step 1: Market scanning and filtering
 ├── brain.py             # Step 2: Claude analysis + Kelly sizing
-├── executor.py          # Step 3: Consensus multi-agent execution
-├── exit_monitor.py      # Step 4: Exit triggers
+├── executor.py          # Step 3: Consensus multi-agent execution (live orders)
+├── exit_monitor.py      # Step 4: Exit triggers (live closes)
+├── data_analyzer.py     # Optional: analyze your fill history
 ├── start.sh             # Startup script for VPS deployment
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment variable template
 └── data/                # Runtime data (gitignored)
-    ├── targets.json     # Top wallets from poly_data analysis
     ├── markets.json     # Latest market scan
     ├── queue.json       # Prescreened markets for brain
     ├── thesis.json      # Actionable theses from Claude
-    └── trades.json      # Trade log
+    ├── trades.json      # Trade log
+    └── fills.json       # Fill history from Kalshi
 ```
 
-## Built On
+## Kalshi vs Polymarket
 
-| Repo | What it provides |
-|------|-----------------|
-| [warproxxx/poly_data](https://github.com/warproxxx/poly_data) | 86M+ historical trades, every wallet |
-| [Polymarket/polymarket-cli](https://github.com/Polymarket/polymarket-cli) | Market scanning, order book data, trade execution |
-| [Polymarket/agents](https://github.com/Polymarket/agents) | Agent framework, LLM integration |
-| [dylanpersonguy/Polymarket-Trading-Bot](https://github.com/dylanpersonguy/Polymarket-Trading-Bot) | 7 strategies, execution engine patterns |
+| | Kalshi | Polymarket |
+|---|---|---|
+| **Regulation** | CFTC-regulated (legal in US) | Offshore |
+| **Auth** | RSA-PSS signed headers | Wallet-based / CLOB API key |
+| **Pricing** | Cents (1-99) per contract | Fractional (0.0-1.0) per share |
+| **Settlement** | $1.00 per winning contract | $1.00 per winning share |
+| **Infrastructure** | Centralized exchange | On-chain (Polygon) |
 
 ## Cost
 
+With default settings (2h brain interval, $100 bankroll, Haiku pre-screen + Sonnet deep):
+
 | Component | Monthly Cost |
 |-----------|-------------|
-| Claude API | ~$20 |
+| Claude API (Haiku + Sonnet) | ~$20 |
 | VPS (Hetzner) | $5 |
 | Everything else | Free |
 | **Total** | **~$25** |
 
-## ⚠️ Disclaimer
+Swap in cheaper models to lower further — Gemini Pro + Flash-Lite drops this to ~$8/mo. See `.env.example` for model overrides.
 
-This bot is for educational and research purposes. Trading on prediction markets involves real financial risk. The authors are not responsible for any losses incurred. Past performance of analyzed wallets does not guarantee future results. Always trade with money you can afford to lose.
+## Disclaimer
+
+This bot is for educational and research purposes. Trading on prediction markets involves real financial risk. Use demo mode first. The authors are not responsible for any losses incurred. Always start with the Kalshi demo environment before trading with real money.
 
 ## License
 

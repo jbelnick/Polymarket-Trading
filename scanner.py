@@ -1,7 +1,7 @@
 """
-Polymarket Trading Bot — Step 1: Market Scanner
+Kalshi Trading Bot — Step 1: Market Scanner
 
-Pulls active markets via polymarket-cli, scores them, and writes survivors
+Pulls active markets via the Kalshi API, scores them, and writes survivors
 to data/queue.json for the brain to evaluate.
 
 Runs in a loop (SCAN_INTERVAL_SEC) or once when called directly.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import (
@@ -24,67 +24,82 @@ from config import (
     MIN_EDGE_GAP,
     MIN_HOURS_TO_RESOLUTION,
     MIN_MARKET_VOLUME,
-    POLYMARKET_CLI,
     QUEUE_FILE,
     SCAN_INTERVAL_SEC,
 )
+from kalshi_client import KalshiClient
 from models import Market, ScoredMarket
 
 logger = logging.getLogger(__name__)
 
 
-# ── Polymarket CLI wrappers ────────────────────────────────────────────────────
-
-
-def _run_cli(*args: str) -> dict | list:
-    """Run a polymarket-cli command and return parsed JSON."""
-    cmd = [POLYMARKET_CLI, *args, "-o", "json"]
-    logger.debug("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f"polymarket-cli failed: {result.stderr.strip()}")
-    return json.loads(result.stdout)
-
-
-def fetch_markets(limit: int = MARKET_SCAN_LIMIT) -> list[dict]:
-    """Pull every active market as JSON."""
-    return _run_cli("markets", "list", "--limit", str(limit))
-
-
-def fetch_order_book(token_id: str) -> dict:
-    """Get the order book for a token."""
-    return _run_cli("clob", "book", token_id)
-
-
-def fetch_midpoint(token_id: str) -> float:
-    """Get the current midpoint price for a token."""
-    data = _run_cli("clob", "midpoint", token_id)
-    return float(data.get("mid", data.get("midpoint", 0)))
-
-
 # ── Market parsing ─────────────────────────────────────────────────────────────
 
 
-def parse_market(raw: dict) -> Market | None:
-    """Convert raw CLI JSON into a Market dataclass. Returns None if unparseable."""
+def _hours_until(iso_ts: str | None) -> float:
+    """Convert an ISO 8601 timestamp to hours from now."""
+    if not iso_ts:
+        return 0.0
     try:
-        token_id = raw.get("token_id") or raw.get("tokens", [{}])[0].get("token_id", "")
-        if not token_id:
+        # Handle both "Z" and "+00:00" suffixes
+        ts = iso_ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        delta = dt - datetime.now(timezone.utc)
+        return max(delta.total_seconds() / 3600, 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def parse_market(raw: dict, client: KalshiClient | None = None) -> Market | None:
+    """Convert raw Kalshi API JSON into a Market dataclass."""
+    try:
+        ticker = raw.get("ticker", "")
+        if not ticker:
             return None
 
-        return Market(
-            condition_id=raw.get("condition_id", ""),
-            question=raw.get("question", ""),
-            token_id=token_id,
-            midpoint=float(raw.get("midpoint", 0) or 0),
-            bids_depth=float(raw.get("bids_depth", 0) or 0),
-            asks_depth=float(raw.get("asks_depth", 0) or 0),
-            volume_24h=float(raw.get("volume_24h", 0) or raw.get("volume", 0) or 0),
-            hours_to_resolution=float(raw.get("hours_to_resolution", 0) or 0),
-            category=raw.get("category", "").lower(),
-            outcomes=raw.get("outcomes", []),
+        status = raw.get("status", "")
+        if status != "open":
+            return None
+
+        yes_price = (raw.get("yes_price", 0) or 0)
+        no_price = (raw.get("no_price", 0) or 0)
+
+        # Kalshi returns prices in cents — convert to dollars
+        if yes_price > 1:
+            yes_price = yes_price / 100
+        if no_price > 1:
+            no_price = no_price / 100
+
+        yes_bid = (raw.get("yes_bid", 0) or 0)
+        yes_ask = (raw.get("yes_ask", 0) or 0)
+        if yes_bid > 1:
+            yes_bid = yes_bid / 100
+        if yes_ask > 1:
+            yes_ask = yes_ask / 100
+
+        hours = _hours_until(
+            raw.get("close_time")
+            or raw.get("expiration_time")
+            or raw.get("expected_expiration_time")
         )
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+
+        return Market(
+            ticker=ticker,
+            event_ticker=raw.get("event_ticker", ""),
+            title=raw.get("title", raw.get("question", "")),
+            subtitle=raw.get("subtitle", ""),
+            yes_price=yes_price,
+            no_price=no_price,
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            volume=int(raw.get("volume", 0) or 0),
+            volume_24h=int(raw.get("volume_24h", 0) or 0),
+            open_interest=int(raw.get("open_interest", 0) or 0),
+            hours_to_resolution=hours,
+            category=raw.get("category", "").lower(),
+            status=status,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
         logger.debug("Skipping unparseable market: %s", exc)
         return None
 
@@ -95,54 +110,45 @@ def parse_market(raw: dict) -> Market | None:
 def score_market(market: Market, claude_estimate: float) -> ScoredMarket | None:
     """
     Score a market on three factors:
-      1. gap between market price and Claude's probability estimate
-      2. order book depth — at least MIN_BOOK_DEPTH on both sides
-      3. hours until resolution — sweet spot is MIN_HOURS … MAX_HOURS
+      1. Gap between market price and Claude's probability estimate
+      2. Order book depth
+      3. Hours until resolution — sweet spot is MIN_HOURS … MAX_HOURS
 
     Returns None (killed) if any filter fails.
     """
-    price = market.midpoint
+    price = market.yes_price
     gap = abs(claude_estimate - price)
-    depth = min(market.bids_depth, market.asks_depth)
+    depth = min(market.yes_bid, market.yes_ask) * market.open_interest if market.open_interest else 0
     hours = market.hours_to_resolution
 
-    # ── Hard kills ─────────────────────────────────────────────────────────
     if gap < MIN_EDGE_GAP:
-        return None  # edge too thin
-    if depth < MIN_BOOK_DEPTH:
-        return None  # can't fill
+        return None
     if hours < MIN_HOURS_TO_RESOLUTION:
-        return None  # too late
+        return None
     if hours > MAX_HOURS_TO_RESOLUTION:
-        return None  # too slow
+        return None
     if market.volume_24h < MIN_MARKET_VOLUME:
-        return None  # slippage risk
+        return None
     if market.category in DISABLED_CATEGORIES:
-        return None  # disabled category (e.g. sports)
+        return None
 
-    ev = round(gap * depth * 0.001, 2)
+    ev = round(gap * max(depth, 1) * 0.001, 2)
 
     return ScoredMarket(
         market=market,
         gap=round(gap, 3),
-        depth=depth,
+        depth_dollars=depth,
         hours=hours,
         ev=ev,
         claude_estimate=claude_estimate,
     )
 
 
-# ── Quick pre-screen (no Claude call yet) ─────────────────────────────────────
+# ── Pre-screen (no Claude call yet) ───────────────────────────────────────────
 
 
 def prescreen_market(market: Market) -> bool:
-    """
-    Cheap filter before we spend a Claude API call on probability estimation.
-    Checks depth, hours, volume, and category only.
-    """
-    depth = min(market.bids_depth, market.asks_depth)
-    if depth < MIN_BOOK_DEPTH:
-        return False
+    """Cheap filter before spending a Claude API call."""
     if market.hours_to_resolution < MIN_HOURS_TO_RESOLUTION:
         return False
     if market.hours_to_resolution > MAX_HOURS_TO_RESOLUTION:
@@ -151,6 +157,8 @@ def prescreen_market(market: Market) -> bool:
         return False
     if market.category in DISABLED_CATEGORIES:
         return False
+    if market.yes_price <= 0.03 or market.yes_price >= 0.97:
+        return False  # too close to resolution — no edge
     return True
 
 
@@ -161,13 +169,16 @@ def save_queue(scored: list[ScoredMarket], path: Path = QUEUE_FILE) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = [
         {
-            "condition_id": s.market.condition_id,
-            "question": s.market.question,
-            "token_id": s.market.token_id,
-            "midpoint": s.market.midpoint,
+            "ticker": s.market.ticker,
+            "event_ticker": s.market.event_ticker,
+            "title": s.market.title,
+            "yes_price": s.market.yes_price,
+            "no_price": s.market.no_price,
+            "volume_24h": s.market.volume_24h,
+            "open_interest": s.market.open_interest,
+            "hours_to_resolution": s.hours,
             "gap": s.gap,
-            "depth": s.depth,
-            "hours": s.hours,
+            "depth_dollars": s.depth_dollars,
             "ev": s.ev,
             "claude_estimate": s.claude_estimate,
             "category": s.market.category,
@@ -187,14 +198,17 @@ def load_queue(path: Path = QUEUE_FILE) -> list[dict]:
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 
-async def scan_loop() -> None:
-    """Continuous scanning loop. Writes queue.json each cycle."""
+async def scan_loop(client: KalshiClient | None = None) -> None:
+    """Continuous scanning loop. Writes markets.json each cycle."""
     logger.info("Scanner starting — interval %ds", SCAN_INTERVAL_SEC)
+
+    if client is None:
+        client = KalshiClient()
 
     while True:
         try:
-            raw_markets = fetch_markets()
-            logger.info("Fetched %d markets from CLI", len(raw_markets))
+            raw_markets = client.get_all_markets(status="open", limit=MARKET_SCAN_LIMIT)
+            logger.info("Fetched %d markets from Kalshi", len(raw_markets))
 
             markets = [m for raw in raw_markets if (m := parse_market(raw)) is not None]
             prescreened = [m for m in markets if prescreen_market(m)]
@@ -204,18 +218,16 @@ async def scan_loop() -> None:
                 len(prescreened),
             )
 
-            # At this stage we don't have Claude estimates yet.
-            # Save prescreened markets for the brain to estimate and score.
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             prescreened_payload = [
                 {
-                    "condition_id": m.condition_id,
-                    "question": m.question,
-                    "token_id": m.token_id,
-                    "midpoint": m.midpoint,
-                    "bids_depth": m.bids_depth,
-                    "asks_depth": m.asks_depth,
+                    "ticker": m.ticker,
+                    "event_ticker": m.event_ticker,
+                    "title": m.title,
+                    "yes_price": m.yes_price,
+                    "no_price": m.no_price,
                     "volume_24h": m.volume_24h,
+                    "open_interest": m.open_interest,
                     "hours_to_resolution": m.hours_to_resolution,
                     "category": m.category,
                 }
